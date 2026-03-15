@@ -1,14 +1,14 @@
 {
-	"name": "n8n-nodes-<...>",
-	"version": "0.1.0",
-	"description": "",
+	"name": "n8n-nodes-openai-advanced",
+	"version": "0.1.13",
+	"description": "n8n community node for OpenAI with LiteLLM prompt caching support",
 	"license": "MIT",
 	"homepage": "",
 	"keywords": [
 		"n8n-community-node-package"
 	],
 	"author": {
-		"name": "",
+		"name": "Amir Souchami",
 		"email": ""
 	},
 	"repository": {
@@ -16,13 +16,13 @@
 		"url": "https://github.com/<...>/n8n-nodes-<...>.git"
 	},
 	"scripts": {
-		"build": "n8n-node build",
+		"build": "tsc && cp nodes/LMOpenAiAdvanced/*.svg dist/nodes/LMOpenAiAdvanced/",
 		"build:watch": "tsc --watch",
 		"dev": "n8n-node dev",
 		"lint": "n8n-node lint",
 		"lint:fix": "n8n-node lint --fix",
 		"release": "n8n-node release",
-		"prepublishOnly": "n8n-node prerelease"
+		"prepublishOnly": "npm run build"
 	},
 	"files": [
 		"dist"
@@ -30,21 +30,22 @@
 	"n8n": {
 		"n8nNodesApiVersion": 1,
 		"strict": true,
-		"credentials": [
-			"dist/credentials/GithubIssuesApi.credentials.js",
-			"dist/credentials/GithubIssuesOAuth2Api.credentials.js"
-		],
 		"nodes": [
-			"dist/nodes/GithubIssues/GithubIssues.node.js",
-			"dist/nodes/Example/Example.node.js"
+			"dist/nodes/LMOpenAiAdvanced/LmOpenAiAdvanced.node.js"
 		]
 	},
 	"devDependencies": {
-		"@n8n/node-cli": "*",
+		"@langchain/openai": "*",
+		"@n8n/ai-utilities": "*",
+		"@n8n/node-cli": "^0.23.0",
 		"eslint": "9.32.0",
 		"prettier": "3.6.2",
 		"release-it": "^19.0.4",
 		"typescript": "5.9.2"
+	},
+	"dependencies": {
+		"@langchain/openai": "*",
+		"@n8n/ai-utilities": "*"
 	},
 	"peerDependencies": {
 		"n8n-workflow": "*"
