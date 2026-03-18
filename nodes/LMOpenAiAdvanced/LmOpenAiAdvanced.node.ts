@@ -35,41 +35,6 @@ function createCustomFetch(
 			try {
 				const reqBody = JSON.parse(init.body as string);
 
-				// Clean up tool search artifacts from prior conversation turns
-				// LangChain stores server-side tool_use/tool_result in history, which causes
-				// "unexpected tool_use_id in tool_result blocks" errors on subsequent API calls
-				if (wrapperOptions.toolSearch && Array.isArray(reqBody.messages)) {
-					const toolSearchCallIds = new Set<string>();
-
-					for (const msg of reqBody.messages) {
-						if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)) {
-							for (const tc of msg.tool_calls) {
-								if (
-									tc.function?.name?.startsWith('tool_search_tool_') ||
-									tc.id?.startsWith('srvtoolu_')
-								) {
-									toolSearchCallIds.add(tc.id);
-								}
-							}
-							msg.tool_calls = msg.tool_calls.filter(
-								(tc: any) =>
-									!tc.function?.name?.startsWith('tool_search_tool_') &&
-									!tc.id?.startsWith('srvtoolu_'),
-							);
-							if (msg.tool_calls.length === 0) {
-								delete msg.tool_calls;
-							}
-						}
-					}
-
-					if (toolSearchCallIds.size > 0) {
-						reqBody.messages = reqBody.messages.filter((msg: any) => {
-							if (msg.role !== 'tool') return true;
-							return !toolSearchCallIds.has(msg.tool_call_id);
-						});
-					}
-				}
-
 				// Inject tool search tool into the tools array
 				if (wrapperOptions.toolSearch) {
 					const variant = wrapperOptions.toolSearch.variant;
@@ -125,41 +90,6 @@ function createCustomFetch(
 		const response = await fetch(input, init);
 
 		if (!url.includes('/chat/completions')) return response;
-
-		// Strip tool search tool_calls from response so LangChain doesn't store them in history
-		if (wrapperOptions.toolSearch) {
-			try {
-				const cloned = response.clone();
-				const body = (await cloned.json()) as Record<string, any>;
-				let modified = false;
-
-				if (Array.isArray(body.choices)) {
-					for (const choice of body.choices) {
-						if (Array.isArray(choice.message?.tool_calls)) {
-							const before = choice.message.tool_calls.length;
-							choice.message.tool_calls = choice.message.tool_calls.filter(
-								(tc: any) =>
-									!tc.function?.name?.startsWith('tool_search_tool_') &&
-									!tc.id?.startsWith('srvtoolu_'),
-							);
-							if (choice.message.tool_calls.length !== before) modified = true;
-							if (choice.message.tool_calls.length === 0) {
-								delete choice.message.tool_calls;
-								if (!choice.message.content) choice.message.content = '';
-							}
-						}
-					}
-				}
-
-				if (modified) {
-					return new Response(JSON.stringify(body), {
-						status: response.status,
-						statusText: response.statusText,
-						headers: response.headers,
-					});
-				}
-			} catch {}
-		}
 
 		// Log cache usage from response
 		if (wrapperOptions.enableDebugLogging && wrapperOptions.enableCacheLogging) {
