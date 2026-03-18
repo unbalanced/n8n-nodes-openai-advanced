@@ -12,6 +12,7 @@ import {
 
 interface FetchWrapperOptions {
 	enableCacheLogging?: boolean;
+	enableDebugLogging?: boolean;
 	toolSearch?: {
 		variant: 'regex' | 'bm25';
 	};
@@ -93,16 +94,18 @@ function createCustomFetch(
 							name: toolSearchName,
 						});
 
-						/*logger.info(
-							`[ToolSearch] Injected ${toolSearchName} + defer_loading on ${reqBody.tools.length - 1} tools`,
-						);*/
+						if (wrapperOptions.enableDebugLogging) {
+							logger.info(
+								`[ToolSearch] Injected ${toolSearchName} + defer_loading on ${reqBody.tools.length - 1} tools`,
+							);
+						}
 					}
 
 					init = { ...init, body: JSON.stringify(reqBody) };
 				}
 
 				// Log cache injection points
-				/*if (wrapperOptions.enableCacheLogging) {
+				if (wrapperOptions.enableDebugLogging && wrapperOptions.enableCacheLogging) {
 					logger.info(
 						`[PromptCache] request body keys: ${JSON.stringify(Object.keys(reqBody))}`,
 					);
@@ -115,7 +118,7 @@ function createCustomFetch(
 							`[PromptCache] WARNING: cache_control_injection_points NOT in request body`,
 						);
 					}
-				}*/
+				}
 			} catch {}
 		}
 
@@ -159,7 +162,7 @@ function createCustomFetch(
 		}
 
 		// Log cache usage from response
-		/*if (wrapperOptions.enableCacheLogging) {
+		if (wrapperOptions.enableDebugLogging && wrapperOptions.enableCacheLogging) {
 			const cloned = response.clone();
 			cloned
 				.json()
@@ -174,7 +177,7 @@ function createCustomFetch(
 					const promptTokens = usage.prompt_tokens ?? 0;
 					const completionTokens = usage.completion_tokens ?? 0;
 
-					ogger.info(
+					logger.info(
 						`[PromptCache] prompt=${promptTokens} completion=${completionTokens} cache_creation=${cacheCreation} cache_read=${cacheRead}`,
 					);
 
@@ -189,7 +192,7 @@ function createCustomFetch(
 					}
 				})
 				.catch(() => {});
-		}*/
+		}
 
 		return response;
 	};
@@ -208,6 +211,7 @@ type ModelOptions = {
 	topP?: number;
 	enablePromptCaching?: boolean;
 	cacheTtl?: string;
+	enableDebugLogging?: boolean;
 	enableToolSearch?: boolean;
 	toolSearchVariant?: 'regex' | 'bm25';
 };
@@ -436,6 +440,14 @@ export class LmOpenAiAdvanced implements INodeType {
 						type: 'boolean',
 					},
 					{
+						displayName: 'Enable Debug Logging',
+						name: 'enableDebugLogging',
+						default: false,
+						description:
+							'Whether to log debug information for prompt caching and tool search to n8n logs',
+						type: 'boolean',
+					},
+					{
 						displayName: 'Enable Tool Search',
 						name: 'enableToolSearch',
 						default: false,
@@ -636,6 +648,10 @@ export class LmOpenAiAdvanced implements INodeType {
 
 		// Set up custom fetch wrapper for cache logging and/or tool search injection
 		const fetchWrapperOptions: FetchWrapperOptions = {};
+
+		if (options.enableDebugLogging) {
+			fetchWrapperOptions.enableDebugLogging = true;
+		}
 
 		if (options.enablePromptCaching) {
 			fetchWrapperOptions.enableCacheLogging = true;
