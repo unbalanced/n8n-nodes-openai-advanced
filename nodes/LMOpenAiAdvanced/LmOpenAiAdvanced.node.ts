@@ -13,6 +13,7 @@ import {
 interface FetchWrapperOptions {
 	enableCacheLogging?: boolean;
 	enableDebugLogging?: boolean;
+	stripToolSearchArtifacts?: boolean;
 	toolSearch?: {
 		variant: 'regex' | 'bm25';
 	};
@@ -34,6 +35,34 @@ function createCustomFetch(
 		if (url.includes('/chat/completions') && init?.body) {
 			try {
 				const reqBody = JSON.parse(init.body as string);
+
+				// Strip tool search artifacts from conversation history
+				if (wrapperOptions.stripToolSearchArtifacts && Array.isArray(reqBody.messages)) {
+					for (const msg of reqBody.messages) {
+						if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)) {
+							msg.tool_calls = msg.tool_calls.filter(
+								(tc: any) =>
+									!tc.function?.name?.startsWith('tool_search_tool_') &&
+									!tc.id?.startsWith('srvtoolu_'),
+							);
+							if (msg.tool_calls.length === 0) {
+								delete msg.tool_calls;
+							}
+						}
+						if (Array.isArray(msg.content)) {
+							msg.content = msg.content.filter(
+								(block: any) =>
+									!(block.type === 'tool_use' && block.id?.startsWith('srvtoolu_')) &&
+									!(block.type === 'tool_result' && block.tool_use_id?.startsWith('srvtoolu_')),
+							);
+						}
+					}
+					reqBody.messages = reqBody.messages.filter((msg: any) => {
+						if (msg.role === 'tool' && msg.tool_call_id?.startsWith('srvtoolu_')) return false;
+						return true;
+					});
+					init = { ...init, body: JSON.stringify(reqBody) };
+				}
 
 				// Inject tool search tool into the tools array
 				if (wrapperOptions.toolSearch) {
@@ -91,6 +120,41 @@ function createCustomFetch(
 
 		if (!url.includes('/chat/completions')) return response;
 
+		// Strip tool search tool_calls from response to prevent conversation history corruption
+		if (wrapperOptions.stripToolSearchArtifacts) {
+			try {
+				const cloned = response.clone();
+				const body = (await cloned.json()) as Record<string, any>;
+				let modified = false;
+
+				if (Array.isArray(body.choices)) {
+					for (const choice of body.choices) {
+						if (Array.isArray(choice.message?.tool_calls)) {
+							const before = choice.message.tool_calls.length;
+							choice.message.tool_calls = choice.message.tool_calls.filter(
+								(tc: any) =>
+									!tc.function?.name?.startsWith('tool_search_tool_') &&
+									!tc.id?.startsWith('srvtoolu_'),
+							);
+							if (choice.message.tool_calls.length !== before) modified = true;
+							if (choice.message.tool_calls.length === 0) {
+								delete choice.message.tool_calls;
+								if (!choice.message.content) choice.message.content = '';
+							}
+						}
+					}
+				}
+
+				if (modified) {
+					return new Response(JSON.stringify(body), {
+						status: response.status,
+						statusText: response.statusText,
+						headers: response.headers,
+					});
+				}
+			} catch {}
+		}
+
 		// Log cache usage from response
 		if (wrapperOptions.enableDebugLogging && wrapperOptions.enableCacheLogging) {
 			const cloned = response.clone();
@@ -143,6 +207,7 @@ type ModelOptions = {
 	cacheTtl?: string;
 	enableDebugLogging?: boolean;
 	enableToolSearch?: boolean;
+	stripToolSearchArtifacts?: boolean;
 	toolSearchVariant?: 'regex' | 'bm25';
 };
 
@@ -412,6 +477,19 @@ export class LmOpenAiAdvanced implements INodeType {
 						description: 'The search algorithm variant to use for tool discovery',
 					},
 					{
+						displayName: 'Strip Tool Search Artifacts',
+						name: 'stripToolSearchArtifacts',
+						default: false,
+						description:
+							'Whether to strip server-side tool search entries (srvtoolu_) from API responses and conversation history. Enable this to fix "unexpected tool_use_id in tool_result blocks" errors in multi-turn conversations.',
+						type: 'boolean',
+						displayOptions: {
+							show: {
+								enableToolSearch: [true],
+							},
+						},
+					},
+					{
 						displayName: 'Frequency Penalty',
 						name: 'frequencyPenalty',
 						default: 0,
@@ -591,6 +669,10 @@ export class LmOpenAiAdvanced implements INodeType {
 			fetchWrapperOptions.toolSearch = {
 				variant: options.toolSearchVariant ?? 'regex',
 			};
+		}
+
+		if (options.stripToolSearchArtifacts) {
+			fetchWrapperOptions.stripToolSearchArtifacts = true;
 		}
 
 		if (Object.keys(fetchWrapperOptions).length > 0) {
