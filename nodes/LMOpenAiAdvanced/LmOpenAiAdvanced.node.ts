@@ -140,6 +140,10 @@ function createCustomFetch(
 							if (choice.message.tool_calls.length === 0) {
 								delete choice.message.tool_calls;
 								if (!choice.message.content) choice.message.content = '';
+								// Fix finish_reason so LangChain doesn't loop expecting tool calls
+								if (choice.finish_reason === 'tool_calls' || choice.finish_reason === 'tool_use') {
+									choice.finish_reason = 'stop';
+								}
 							}
 						}
 					}
@@ -479,9 +483,9 @@ export class LmOpenAiAdvanced implements INodeType {
 					{
 						displayName: 'Strip Tool Search Artifacts',
 						name: 'stripToolSearchArtifacts',
-						default: false,
+						default: true,
 						description:
-							'Whether to strip server-side tool search entries (srvtoolu_) from API responses and conversation history. Enable this to fix "unexpected tool_use_id in tool_result blocks" errors in multi-turn conversations.',
+							'Whether to strip server-side tool search entries (srvtoolu_) from API responses and conversation history. Prevents agent loops and "unexpected tool_use_id in tool_result blocks" errors in multi-turn conversations.',
 						type: 'boolean',
 						displayOptions: {
 							show: {
