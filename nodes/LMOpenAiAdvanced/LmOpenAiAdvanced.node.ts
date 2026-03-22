@@ -38,29 +38,44 @@ function createCustomFetch(
 
 				// Strip tool search artifacts from conversation history
 				if (wrapperOptions.stripToolSearchArtifacts && Array.isArray(reqBody.messages)) {
+					let requestStripped = 0;
+
 					for (const msg of reqBody.messages) {
 						if (msg.role === 'assistant' && Array.isArray(msg.tool_calls)) {
+							const beforeLen = msg.tool_calls.length;
 							msg.tool_calls = msg.tool_calls.filter(
 								(tc: any) =>
 									!tc.function?.name?.startsWith('tool_search_tool_') &&
 									!tc.id?.startsWith('srvtoolu_'),
 							);
+							requestStripped += beforeLen - msg.tool_calls.length;
 							if (msg.tool_calls.length === 0) {
 								delete msg.tool_calls;
 							}
 						}
 						if (Array.isArray(msg.content)) {
+							const beforeLen = msg.content.length;
 							msg.content = msg.content.filter(
 								(block: any) =>
 									!(block.type === 'tool_use' && block.id?.startsWith('srvtoolu_')) &&
 									!(block.type === 'tool_result' && block.tool_use_id?.startsWith('srvtoolu_')),
 							);
+							requestStripped += beforeLen - msg.content.length;
 						}
 					}
+					const beforeMsgCount = reqBody.messages.length;
 					reqBody.messages = reqBody.messages.filter((msg: any) => {
 						if (msg.role === 'tool' && msg.tool_call_id?.startsWith('srvtoolu_')) return false;
 						return true;
 					});
+					requestStripped += beforeMsgCount - reqBody.messages.length;
+
+					if (wrapperOptions.enableDebugLogging && requestStripped > 0) {
+						logger.info(
+							`[ToolSearch] Stripped ${requestStripped} artifact(s) from request history (${reqBody.messages.length} messages remain)`,
+						);
+					}
+
 					init = { ...init, body: JSON.stringify(reqBody) };
 				}
 
@@ -131,18 +146,44 @@ function createCustomFetch(
 					for (const choice of body.choices) {
 						if (Array.isArray(choice.message?.tool_calls)) {
 							const before = choice.message.tool_calls.length;
+
+							if (wrapperOptions.enableDebugLogging) {
+								for (const tc of choice.message.tool_calls) {
+									const name = tc.function?.name ?? '(no name)';
+									const id = tc.id ?? '(no id)';
+									const isToolSearch = name.startsWith('tool_search_tool_');
+									const isSrvToolU = id.startsWith('srvtoolu_');
+									const willStrip = isToolSearch || isSrvToolU;
+									logger.info(
+										`[ToolSearch] Response tool_call: id=${id} name=${name} willStrip=${willStrip} (isToolSearchName=${isToolSearch}, isSrvToolUId=${isSrvToolU})`,
+									);
+								}
+							}
+
 							choice.message.tool_calls = choice.message.tool_calls.filter(
 								(tc: any) =>
 									!tc.function?.name?.startsWith('tool_search_tool_') &&
 									!tc.id?.startsWith('srvtoolu_'),
 							);
 							if (choice.message.tool_calls.length !== before) modified = true;
+
+							if (wrapperOptions.enableDebugLogging && modified) {
+								logger.info(
+									`[ToolSearch] Stripped ${before - choice.message.tool_calls.length} of ${before} tool_calls, ${choice.message.tool_calls.length} remaining`,
+								);
+							}
+
 							if (choice.message.tool_calls.length === 0) {
 								delete choice.message.tool_calls;
 								if (!choice.message.content) choice.message.content = '';
 								// Fix finish_reason so LangChain doesn't loop expecting tool calls
 								if (choice.finish_reason === 'tool_calls' || choice.finish_reason === 'tool_use') {
 									choice.finish_reason = 'stop';
+									if (wrapperOptions.enableDebugLogging) {
+										logger.info(
+											`[ToolSearch] All tool_calls stripped — changed finish_reason to 'stop'`,
+										);
+									}
 								}
 							}
 						}
@@ -675,7 +716,10 @@ export class LmOpenAiAdvanced implements INodeType {
 			};
 		}
 
-		if (options.stripToolSearchArtifacts) {
+		// Enable stripping by default when tool search is on, unless explicitly disabled
+		if (options.enableToolSearch && options.stripToolSearchArtifacts !== false) {
+			fetchWrapperOptions.stripToolSearchArtifacts = true;
+		} else if (options.stripToolSearchArtifacts) {
 			fetchWrapperOptions.stripToolSearchArtifacts = true;
 		}
 
