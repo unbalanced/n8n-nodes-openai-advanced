@@ -19,6 +19,33 @@ interface FetchWrapperOptions {
 	};
 }
 
+function logCacheUsage(
+	logger: ISupplyDataFunctions['logger'],
+	body: Record<string, unknown>,
+): void {
+	const usage = body?.usage as Record<string, number> | undefined;
+	if (!usage) return;
+
+	logger.info(`[PromptCache] raw usage: ${JSON.stringify(usage)}`);
+
+	const cacheCreation = usage.cache_creation_input_tokens ?? 0;
+	const cacheRead = usage.cache_read_input_tokens ?? 0;
+	const promptTokens = usage.prompt_tokens ?? 0;
+	const completionTokens = usage.completion_tokens ?? 0;
+
+	logger.info(
+		`[PromptCache] prompt=${promptTokens} completion=${completionTokens} cache_creation=${cacheCreation} cache_read=${cacheRead}`,
+	);
+
+	if (cacheRead > 0) {
+		logger.info(`[PromptCache] Cache HIT — ${cacheRead} tokens read from cache`);
+	} else if (cacheCreation > 0) {
+		logger.info(`[PromptCache] Cache WRITE — ${cacheCreation} tokens written to cache`);
+	} else {
+		logger.info(`[PromptCache] Cache MISS — no cache activity detected`);
+	}
+}
+
 function createCustomFetch(
 	logger: ISupplyDataFunctions['logger'],
 	wrapperOptions: FetchWrapperOptions,
@@ -143,8 +170,8 @@ function createCustomFetch(
 		const needsCacheLogging =
 			wrapperOptions.enableDebugLogging && wrapperOptions.enableCacheLogging;
 
-		// Parse response body once if we need to inspect/modify it
-		if (needsStripping || needsCacheLogging) {
+		// Only intercept and reconstruct the response when stripping is needed
+		if (needsStripping) {
 			let body: Record<string, any>;
 			try {
 				body = (await response.json()) as Record<string, any>;
@@ -157,8 +184,8 @@ function createCustomFetch(
 				return response;
 			}
 
-			// Strip tool search tool_calls from response to prevent conversation history corruption
-			if (needsStripping && Array.isArray(body.choices)) {
+			// Strip tool search tool_calls from response
+			if (Array.isArray(body.choices)) {
 				for (const choice of body.choices) {
 					if (Array.isArray(choice.message?.tool_calls)) {
 						const before = choice.message.tool_calls.length;
@@ -182,7 +209,10 @@ function createCustomFetch(
 								!tc.id?.startsWith('srvtoolu_'),
 						);
 
-						if (wrapperOptions.enableDebugLogging && choice.message.tool_calls.length !== before) {
+						if (
+							wrapperOptions.enableDebugLogging &&
+							choice.message.tool_calls.length !== before
+						) {
 							logger.info(
 								`[ToolSearch] Stripped ${before - choice.message.tool_calls.length} of ${before} tool_calls, ${choice.message.tool_calls.length} remaining`,
 							);
@@ -210,39 +240,37 @@ function createCustomFetch(
 				}
 			}
 
-			// Log cache usage from response
+			// Also log cache usage since we already have the parsed body
 			if (needsCacheLogging) {
-				const usage = body?.usage;
-				if (usage) {
-					logger.info(`[PromptCache] raw usage: ${JSON.stringify(usage)}`);
-
-					const cacheCreation = usage.cache_creation_input_tokens ?? 0;
-					const cacheRead = usage.cache_read_input_tokens ?? 0;
-					const promptTokens = usage.prompt_tokens ?? 0;
-					const completionTokens = usage.completion_tokens ?? 0;
-
-					logger.info(
-						`[PromptCache] prompt=${promptTokens} completion=${completionTokens} cache_creation=${cacheCreation} cache_read=${cacheRead}`,
-					);
-
-					if (cacheRead > 0) {
-						logger.info(`[PromptCache] Cache HIT — ${cacheRead} tokens read from cache`);
-					} else if (cacheCreation > 0) {
-						logger.info(
-							`[PromptCache] Cache WRITE — ${cacheCreation} tokens written to cache`,
-						);
-					} else {
-						logger.info(`[PromptCache] Cache MISS — no cache activity detected`);
-					}
-				}
+				logCacheUsage(logger, body);
 			}
 
-			// Always return a new Response from the (possibly modified) parsed body
-			return new Response(JSON.stringify(body), {
+			// Build clean headers — do NOT copy content-length/content-encoding/transfer-encoding
+			// from the original response, as the reconstructed body has different size/encoding
+			const newBody = JSON.stringify(body);
+			const newHeaders = new Headers(response.headers);
+			newHeaders.delete('content-length');
+			newHeaders.delete('content-encoding');
+			newHeaders.delete('transfer-encoding');
+
+			return new Response(newBody, {
 				status: response.status,
 				statusText: response.statusText,
-				headers: response.headers,
+				headers: newHeaders,
 			});
+		}
+
+		// Cache logging only — use clone so the original response is returned untouched
+		if (needsCacheLogging) {
+			try {
+				const cloned = response.clone();
+				cloned
+					.json()
+					.then((body) => logCacheUsage(logger, body as Record<string, unknown>))
+					.catch(() => {});
+			} catch {
+				// clone() not supported — skip logging, don't break the response
+			}
 		}
 
 		return response;
@@ -728,10 +756,8 @@ export class LmOpenAiAdvanced implements INodeType {
 			};
 		}
 
-		// Enable stripping by default when tool search is on, unless explicitly disabled
+		// Only enable stripping when tool search is actually on
 		if (options.enableToolSearch && options.stripToolSearchArtifacts !== false) {
-			fetchWrapperOptions.stripToolSearchArtifacts = true;
-		} else if (options.stripToolSearchArtifacts) {
 			fetchWrapperOptions.stripToolSearchArtifacts = true;
 		}
 
