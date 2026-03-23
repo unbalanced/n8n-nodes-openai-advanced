@@ -128,87 +128,92 @@ function createCustomFetch(
 						);
 					}
 				}
-			} catch {}
+			} catch (err) {
+				if (wrapperOptions.enableDebugLogging) {
+					logger.warn(`[Fetch] Failed to process request body: ${(err as Error).message}`);
+				}
+			}
 		}
 
 		const response = await fetch(input, init);
 
 		if (!url.includes('/chat/completions')) return response;
 
-		// Strip tool search tool_calls from response to prevent conversation history corruption
-		if (wrapperOptions.stripToolSearchArtifacts) {
+		const needsStripping = wrapperOptions.stripToolSearchArtifacts;
+		const needsCacheLogging =
+			wrapperOptions.enableDebugLogging && wrapperOptions.enableCacheLogging;
+
+		// Parse response body once if we need to inspect/modify it
+		if (needsStripping || needsCacheLogging) {
+			let body: Record<string, any>;
 			try {
-				const cloned = response.clone();
-				const body = (await cloned.json()) as Record<string, any>;
-				let modified = false;
+				body = (await response.json()) as Record<string, any>;
+			} catch (err) {
+				if (wrapperOptions.enableDebugLogging) {
+					logger.warn(
+						`[Fetch] Failed to parse response body as JSON: ${(err as Error).message}`,
+					);
+				}
+				return response;
+			}
 
-				if (Array.isArray(body.choices)) {
-					for (const choice of body.choices) {
-						if (Array.isArray(choice.message?.tool_calls)) {
-							const before = choice.message.tool_calls.length;
+			// Strip tool search tool_calls from response to prevent conversation history corruption
+			if (needsStripping && Array.isArray(body.choices)) {
+				for (const choice of body.choices) {
+					if (Array.isArray(choice.message?.tool_calls)) {
+						const before = choice.message.tool_calls.length;
 
-							if (wrapperOptions.enableDebugLogging) {
-								for (const tc of choice.message.tool_calls) {
-									const name = tc.function?.name ?? '(no name)';
-									const id = tc.id ?? '(no id)';
-									const isToolSearch = name.startsWith('tool_search_tool_');
-									const isSrvToolU = id.startsWith('srvtoolu_');
-									const willStrip = isToolSearch || isSrvToolU;
-									logger.info(
-										`[ToolSearch] Response tool_call: id=${id} name=${name} willStrip=${willStrip} (isToolSearchName=${isToolSearch}, isSrvToolUId=${isSrvToolU})`,
-									);
-								}
-							}
-
-							choice.message.tool_calls = choice.message.tool_calls.filter(
-								(tc: any) =>
-									!tc.function?.name?.startsWith('tool_search_tool_') &&
-									!tc.id?.startsWith('srvtoolu_'),
-							);
-							if (choice.message.tool_calls.length !== before) modified = true;
-
-							if (wrapperOptions.enableDebugLogging && modified) {
+						if (wrapperOptions.enableDebugLogging) {
+							for (const tc of choice.message.tool_calls) {
+								const name = tc.function?.name ?? '(no name)';
+								const id = tc.id ?? '(no id)';
+								const isToolSearch = name.startsWith('tool_search_tool_');
+								const isSrvToolU = id.startsWith('srvtoolu_');
+								const willStrip = isToolSearch || isSrvToolU;
 								logger.info(
-									`[ToolSearch] Stripped ${before - choice.message.tool_calls.length} of ${before} tool_calls, ${choice.message.tool_calls.length} remaining`,
+									`[ToolSearch] Response tool_call: id=${id} name=${name} willStrip=${willStrip} (isToolSearchName=${isToolSearch}, isSrvToolUId=${isSrvToolU})`,
 								);
 							}
+						}
 
-							if (choice.message.tool_calls.length === 0) {
-								delete choice.message.tool_calls;
-								if (!choice.message.content) choice.message.content = '';
-								// Fix finish_reason so LangChain doesn't loop expecting tool calls
-								if (choice.finish_reason === 'tool_calls' || choice.finish_reason === 'tool_use') {
-									choice.finish_reason = 'stop';
-									if (wrapperOptions.enableDebugLogging) {
-										logger.info(
-											`[ToolSearch] All tool_calls stripped — changed finish_reason to 'stop'`,
-										);
-									}
-								}
-							}
+						choice.message.tool_calls = choice.message.tool_calls.filter(
+							(tc: Record<string, any>) =>
+								!tc.function?.name?.startsWith('tool_search_tool_') &&
+								!tc.id?.startsWith('srvtoolu_'),
+						);
+
+						if (wrapperOptions.enableDebugLogging && choice.message.tool_calls.length !== before) {
+							logger.info(
+								`[ToolSearch] Stripped ${before - choice.message.tool_calls.length} of ${before} tool_calls, ${choice.message.tool_calls.length} remaining`,
+							);
+						}
+
+						if (choice.message.tool_calls.length === 0) {
+							delete choice.message.tool_calls;
+							if (!choice.message.content) choice.message.content = '';
+						}
+					}
+
+					// Fix finish_reason when no real tool_calls remain after stripping
+					if (
+						(choice.finish_reason === 'tool_calls' || choice.finish_reason === 'tool_use') &&
+						(!Array.isArray(choice.message?.tool_calls) ||
+							choice.message.tool_calls.length === 0)
+					) {
+						choice.finish_reason = 'stop';
+						if (wrapperOptions.enableDebugLogging) {
+							logger.info(
+								`[ToolSearch] No real tool_calls remain — changed finish_reason to 'stop'`,
+							);
 						}
 					}
 				}
+			}
 
-				if (modified) {
-					return new Response(JSON.stringify(body), {
-						status: response.status,
-						statusText: response.statusText,
-						headers: response.headers,
-					});
-				}
-			} catch {}
-		}
-
-		// Log cache usage from response
-		if (wrapperOptions.enableDebugLogging && wrapperOptions.enableCacheLogging) {
-			const cloned = response.clone();
-			cloned
-				.json()
-				.then((body: any) => {
-					const usage = body?.usage;
-					if (!usage) return;
-
+			// Log cache usage from response
+			if (needsCacheLogging) {
+				const usage = body?.usage;
+				if (usage) {
 					logger.info(`[PromptCache] raw usage: ${JSON.stringify(usage)}`);
 
 					const cacheCreation = usage.cache_creation_input_tokens ?? 0;
@@ -229,8 +234,15 @@ function createCustomFetch(
 					} else {
 						logger.info(`[PromptCache] Cache MISS — no cache activity detected`);
 					}
-				})
-				.catch(() => {});
+				}
+			}
+
+			// Always return a new Response from the (possibly modified) parsed body
+			return new Response(JSON.stringify(body), {
+				status: response.status,
+				statusText: response.statusText,
+				headers: response.headers,
+			});
 		}
 
 		return response;
