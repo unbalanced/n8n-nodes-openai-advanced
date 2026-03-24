@@ -19,37 +19,12 @@ interface FetchWrapperOptions {
 	};
 }
 
-function logCacheUsage(
-	logger: ISupplyDataFunctions['logger'],
-	body: Record<string, unknown>,
-): void {
-	const usage = body?.usage as Record<string, number> | undefined;
-	if (!usage) return;
-
-	logger.info(`[PromptCache] raw usage: ${JSON.stringify(usage)}`);
-
-	const cacheCreation = usage.cache_creation_input_tokens ?? 0;
-	const cacheRead = usage.cache_read_input_tokens ?? 0;
-	const promptTokens = usage.prompt_tokens ?? 0;
-	const completionTokens = usage.completion_tokens ?? 0;
-
-	logger.info(
-		`[PromptCache] prompt=${promptTokens} completion=${completionTokens} cache_creation=${cacheCreation} cache_read=${cacheRead}`,
-	);
-
-	if (cacheRead > 0) {
-		logger.info(`[PromptCache] Cache HIT — ${cacheRead} tokens read from cache`);
-	} else if (cacheCreation > 0) {
-		logger.info(`[PromptCache] Cache WRITE — ${cacheCreation} tokens written to cache`);
-	} else {
-		logger.info(`[PromptCache] Cache MISS — no cache activity detected`);
-	}
-}
-
 function createCustomFetch(
 	logger: ISupplyDataFunctions['logger'],
 	wrapperOptions: FetchWrapperOptions,
 ): typeof fetch {
+	let callCounter = 0;
+
 	return async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 		const url =
 			typeof input === 'string'
@@ -58,10 +33,52 @@ function createCustomFetch(
 					? input.toString()
 					: (input as Request).url;
 
-		// Intercept request body for chat completions
-		if (url.includes('/chat/completions') && init?.body) {
+		if (!url.includes('/chat/completions')) return fetch(input, init);
+
+		const callId = ++callCounter;
+		const isDebug = wrapperOptions.enableDebugLogging;
+
+		// ── Request processing ──────────────────────────────────────────────
+		if (init?.body) {
 			try {
 				const reqBody = JSON.parse(init.body as string);
+
+				// Debug: log full request summary
+				if (isDebug) {
+					const msgSummary = Array.isArray(reqBody.messages)
+						? reqBody.messages.map((m: Record<string, unknown>) => {
+								const role = m.role as string;
+								const toolCalls = Array.isArray(m.tool_calls)
+									? m.tool_calls.map(
+											(tc: Record<string, unknown>) =>
+												(tc as Record<string, Record<string, string>>).function
+													?.name ?? tc.id,
+										)
+									: undefined;
+								const contentLen =
+									typeof m.content === 'string'
+										? m.content.length
+										: Array.isArray(m.content)
+											? (m.content as unknown[]).length + ' blocks'
+											: 0;
+								return { role, contentLen, ...(toolCalls ? { toolCalls } : {}) };
+							})
+						: 'no messages';
+					const toolNames = Array.isArray(reqBody.tools)
+						? reqBody.tools.map(
+								(t: Record<string, Record<string, string>>) =>
+									t.function?.name ?? t.name ?? t.type,
+							)
+						: [];
+					logger.info(
+						`[Debug][${callId}] REQUEST model=${reqBody.model} messages=${JSON.stringify(msgSummary)} tools=[${toolNames.join(',')}]`,
+					);
+					if (reqBody.cache_control_injection_points) {
+						logger.info(
+							`[Debug][${callId}] cache_control_injection_points=${JSON.stringify(reqBody.cache_control_injection_points)}`,
+						);
+					}
+				}
 
 				// Strip tool search artifacts from conversation history
 				if (wrapperOptions.stripToolSearchArtifacts && Array.isArray(reqBody.messages)) {
@@ -85,21 +102,25 @@ function createCustomFetch(
 							msg.content = msg.content.filter(
 								(block: any) =>
 									!(block.type === 'tool_use' && block.id?.startsWith('srvtoolu_')) &&
-									!(block.type === 'tool_result' && block.tool_use_id?.startsWith('srvtoolu_')),
+									!(
+										block.type === 'tool_result' &&
+										block.tool_use_id?.startsWith('srvtoolu_')
+									),
 							);
 							requestStripped += beforeLen - msg.content.length;
 						}
 					}
 					const beforeMsgCount = reqBody.messages.length;
 					reqBody.messages = reqBody.messages.filter((msg: any) => {
-						if (msg.role === 'tool' && msg.tool_call_id?.startsWith('srvtoolu_')) return false;
+						if (msg.role === 'tool' && msg.tool_call_id?.startsWith('srvtoolu_'))
+							return false;
 						return true;
 					});
 					requestStripped += beforeMsgCount - reqBody.messages.length;
 
-					if (wrapperOptions.enableDebugLogging && requestStripped > 0) {
+					if (isDebug && requestStripped > 0) {
 						logger.info(
-							`[ToolSearch] Stripped ${requestStripped} artifact(s) from request history (${reqBody.messages.length} messages remain)`,
+							`[ToolSearch][${callId}] Stripped ${requestStripped} artifact(s) from request history (${reqBody.messages.length} messages remain)`,
 						);
 					}
 
@@ -117,91 +138,90 @@ function createCustomFetch(
 						variant === 'bm25' ? 'tool_search_tool_bm25' : 'tool_search_tool_regex';
 
 					if (Array.isArray(reqBody.tools) && reqBody.tools.length > 0) {
-						// Add defer_loading to all existing function tools
 						for (const tool of reqBody.tools) {
 							if (tool.type === 'function' && tool.function) {
 								tool.defer_loading = true;
 							}
 						}
 
-						// Prepend the tool search tool
 						reqBody.tools.unshift({
 							type: toolSearchType,
 							name: toolSearchName,
 						});
 
-						if (wrapperOptions.enableDebugLogging) {
+						if (isDebug) {
 							logger.info(
-								`[ToolSearch] Injected ${toolSearchName} + defer_loading on ${reqBody.tools.length - 1} tools`,
+								`[ToolSearch][${callId}] Injected ${toolSearchName} + defer_loading on ${reqBody.tools.length - 1} tools`,
 							);
 						}
 					}
 
 					init = { ...init, body: JSON.stringify(reqBody) };
 				}
-
-				// Log cache injection points
-				if (wrapperOptions.enableDebugLogging && wrapperOptions.enableCacheLogging) {
-					logger.info(
-						`[PromptCache] request body keys: ${JSON.stringify(Object.keys(reqBody))}`,
-					);
-					if (reqBody.cache_control_injection_points) {
-						logger.info(
-							`[PromptCache] injection_points: ${JSON.stringify(reqBody.cache_control_injection_points)}`,
-						);
-					} else {
-						logger.info(
-							`[PromptCache] WARNING: cache_control_injection_points NOT in request body`,
-						);
-					}
-				}
 			} catch (err) {
-				if (wrapperOptions.enableDebugLogging) {
-					logger.warn(`[Fetch] Failed to process request body: ${(err as Error).message}`);
+				if (isDebug) {
+					logger.warn(
+						`[Debug][${callId}] Failed to process request body: ${(err as Error).message}`,
+					);
 				}
 			}
 		}
 
+		// ── Execute fetch ───────────────────────────────────────────────────
 		const response = await fetch(input, init);
 
-		if (!url.includes('/chat/completions')) return response;
-
+		// ── Response processing ─────────────────────────────────────────────
 		const needsStripping = wrapperOptions.stripToolSearchArtifacts;
-		const needsCacheLogging =
-			wrapperOptions.enableDebugLogging && wrapperOptions.enableCacheLogging;
 
-		// Only intercept and reconstruct the response when stripping is needed
-		if (needsStripping) {
+		if (needsStripping || isDebug) {
 			let body: Record<string, any>;
 			try {
 				body = (await response.json()) as Record<string, any>;
 			} catch (err) {
-				if (wrapperOptions.enableDebugLogging) {
+				if (isDebug) {
 					logger.warn(
-						`[Fetch] Failed to parse response body as JSON: ${(err as Error).message}`,
+						`[Debug][${callId}] Failed to parse response JSON: ${(err as Error).message}`,
 					);
 				}
 				return response;
 			}
 
-			// Strip tool search tool_calls from response
-			if (Array.isArray(body.choices)) {
+			// Debug: log full response
+			if (isDebug) {
+				const choices = Array.isArray(body.choices)
+					? body.choices.map((c: Record<string, any>) => ({
+							finish_reason: c.finish_reason,
+							content: c.message?.content
+								? typeof c.message.content === 'string'
+									? c.message.content.substring(0, 200) +
+										(c.message.content.length > 200 ? '...' : '')
+									: `[${(c.message.content as unknown[]).length} blocks]`
+								: null,
+							tool_calls: Array.isArray(c.message?.tool_calls)
+								? c.message.tool_calls.map((tc: Record<string, any>) => ({
+										id: tc.id,
+										name: tc.function?.name,
+										args:
+											typeof tc.function?.arguments === 'string'
+												? tc.function.arguments.substring(0, 100)
+												: tc.function?.arguments,
+									}))
+								: null,
+						}))
+					: 'no choices';
+				logger.info(
+					`[Debug][${callId}] RESPONSE status=${response.status} choices=${JSON.stringify(choices)}`,
+				);
+				if (body.usage) {
+					logger.info(`[Debug][${callId}] usage=${JSON.stringify(body.usage)}`);
+				}
+			}
+
+			// Strip tool search artifacts
+			if (needsStripping && Array.isArray(body.choices)) {
 				for (const choice of body.choices) {
 					if (Array.isArray(choice.message?.tool_calls)) {
 						const before = choice.message.tool_calls.length;
-
-						if (wrapperOptions.enableDebugLogging) {
-							for (const tc of choice.message.tool_calls) {
-								const name = tc.function?.name ?? '(no name)';
-								const id = tc.id ?? '(no id)';
-								const isToolSearch = name.startsWith('tool_search_tool_');
-								const isSrvToolU = id.startsWith('srvtoolu_');
-								const willStrip = isToolSearch || isSrvToolU;
-								logger.info(
-									`[ToolSearch] Response tool_call: id=${id} name=${name} willStrip=${willStrip} (isToolSearchName=${isToolSearch}, isSrvToolUId=${isSrvToolU})`,
-								);
-							}
-						}
 
 						choice.message.tool_calls = choice.message.tool_calls.filter(
 							(tc: Record<string, any>) =>
@@ -209,12 +229,9 @@ function createCustomFetch(
 								!tc.id?.startsWith('srvtoolu_'),
 						);
 
-						if (
-							wrapperOptions.enableDebugLogging &&
-							choice.message.tool_calls.length !== before
-						) {
+						if (isDebug && choice.message.tool_calls.length !== before) {
 							logger.info(
-								`[ToolSearch] Stripped ${before - choice.message.tool_calls.length} of ${before} tool_calls, ${choice.message.tool_calls.length} remaining`,
+								`[ToolSearch][${callId}] Stripped ${before - choice.message.tool_calls.length} of ${before} tool_calls, ${choice.message.tool_calls.length} remaining`,
 							);
 						}
 
@@ -224,29 +241,23 @@ function createCustomFetch(
 						}
 					}
 
-					// Fix finish_reason when no real tool_calls remain after stripping
+					// Fix finish_reason when no real tool_calls remain
 					if (
 						(choice.finish_reason === 'tool_calls' || choice.finish_reason === 'tool_use') &&
 						(!Array.isArray(choice.message?.tool_calls) ||
 							choice.message.tool_calls.length === 0)
 					) {
 						choice.finish_reason = 'stop';
-						if (wrapperOptions.enableDebugLogging) {
+						if (isDebug) {
 							logger.info(
-								`[ToolSearch] No real tool_calls remain — changed finish_reason to 'stop'`,
+								`[ToolSearch][${callId}] No real tool_calls remain — changed finish_reason to 'stop'`,
 							);
 						}
 					}
 				}
 			}
 
-			// Also log cache usage since we already have the parsed body
-			if (needsCacheLogging) {
-				logCacheUsage(logger, body);
-			}
-
-			// Build clean headers — do NOT copy content-length/content-encoding/transfer-encoding
-			// from the original response, as the reconstructed body has different size/encoding
+			// Reconstruct response with clean headers
 			const newBody = JSON.stringify(body);
 			const newHeaders = new Headers(response.headers);
 			newHeaders.delete('content-length');
@@ -258,19 +269,6 @@ function createCustomFetch(
 				statusText: response.statusText,
 				headers: newHeaders,
 			});
-		}
-
-		// Cache logging only — use clone so the original response is returned untouched
-		if (needsCacheLogging) {
-			try {
-				const cloned = response.clone();
-				cloned
-					.json()
-					.then((body) => logCacheUsage(logger, body as Record<string, unknown>))
-					.catch(() => {});
-			} catch {
-				// clone() not supported — skip logging, don't break the response
-			}
 		}
 
 		return response;
@@ -742,26 +740,25 @@ export class LmOpenAiAdvanced implements INodeType {
 		// Set up custom fetch wrapper for cache logging and/or tool search injection
 		const fetchWrapperOptions: FetchWrapperOptions = {};
 
-		if (options.enableDebugLogging) {
-			fetchWrapperOptions.enableDebugLogging = true;
-		}
-
-		if (options.enablePromptCaching) {
-			fetchWrapperOptions.enableCacheLogging = true;
-		}
-
+		// Only create custom fetch wrapper when tool search or debug logging is enabled.
+		// Prompt caching works entirely through headers + modelKwargs and does not
+		// need a fetch interceptor.
 		if (options.enableToolSearch) {
 			fetchWrapperOptions.toolSearch = {
 				variant: options.toolSearchVariant ?? 'regex',
 			};
+
+			if (options.stripToolSearchArtifacts !== false) {
+				fetchWrapperOptions.stripToolSearchArtifacts = true;
+			}
 		}
 
-		// Only enable stripping when tool search is actually on
-		if (options.enableToolSearch && options.stripToolSearchArtifacts !== false) {
-			fetchWrapperOptions.stripToolSearchArtifacts = true;
+		if (options.enableDebugLogging) {
+			fetchWrapperOptions.enableDebugLogging = true;
 		}
 
-		if (Object.keys(fetchWrapperOptions).length > 0) {
+		// Create the wrapper only when there's something to do
+		if (fetchWrapperOptions.toolSearch || fetchWrapperOptions.enableDebugLogging) {
 			configuration.fetch = createCustomFetch(this.logger, fetchWrapperOptions);
 		}
 
